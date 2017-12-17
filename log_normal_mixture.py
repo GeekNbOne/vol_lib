@@ -1,124 +1,138 @@
 import numpy as np
-import pandas as pd
 from scipy.stats import norm
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import pandas as pd
+import pickle
+
+class VolatilitySurface(object):
+
+    def __init__(self, mixture_depth=3):
+        self.mixture_depth = mixture_depth
+        self.X = None
+
+    def calibrate(self, y_true, F, K, r, T, w):
+        X0 = self._generate_X0()
+
+        res = minimize(self._lognormal_mixture_loss, X0, (F, K, r, T, w, y_true), bounds=self._bounds,
+                       constraints=self._constrains)
+
+        self.X = res.x
+
+        return res.message
+
+    def bs_volatility(self,m,T):
+
+        y_true = self._lognormal_mixture_price_moneyness(m,T)
+        X0 = np.random.uniform(0,1,y_true.shape[0])
+        res = minimize(self._bs_loss,X0,(m,T,y_true))
+
+        return res.x
+
+    def save_X(self,file_name):
+        pickle.dump(self.X,open(file_name,'wb'))
+
+    def load_X(self,file_name):
+        self.X = pickle.load(open(file_name,'rb'))
+
+    def _bs_loss(self,n,m,T,y_true):
+        y_pred = self._bs_price(n,m,T)
+
+        return self._loss_mse(y_pred,y_true)
 
 
-class VolatilityCalibration(object):
-    def __init__(self, option_price, future_price, strike, expiration, option_type, N=3, init_vol=0.75):
-        op_len = len(option_price)
-        ft_len = len(future_price)
-        strike_len = len(strike)
-        exp_len = len(expiration)
-        type_len = len(option_type)
-        self.N = N
-        self.init_vol = init_vol
+    def _bs_price(self,n,m,T):
 
-        if not (op_len == ft_len == strike_len == exp_len == type_len):
-            raise ValueError('All parameters supplied shall have the same length')
+        d1 = (m + 0.5 * n**2) / (n * np.sqrt(T))
+        d2 = d1 - n * np.sqrt(T)
 
-        self.option_price = option_price
-        self.future_price = future_price
-        self.strike = strike
-        self.expiration = expiration
-        self.option_type = option_type
+        return  norm.cdf(d1) - np.exp(-m) * norm.cdf(d2)
 
-    class LocalVolatility(object):
 
-        def __init__(self, w, mu, s, M, T, FT, N):
-            M = M / FT
+    def _lognormal_mixture_price_moneyness(self,m,T):
 
-            M, T = np.meshgrid(M, T)
-            self.M = np.reshape(M, (M.shape[0], M.shape[1], 1))
-            self.T = np.reshape(T, (T.shape[0], T.shape[1], 1))
+        l = self.X[:self.mixture_depth].reshape((1,self.mixture_depth))
+        n = self.X[self.mixture_depth:].reshape((1, self.mixture_depth))
 
-            self.w = np.reshape(w, (1, 1, N))
-            self.mu = np.reshape(mu, (1, 1, N))
-            self.s = np.reshape(s, (1, 1, N))
+        m = np.expand_dims(m, 1)
+        T = np.expand_dims(T, 1)
 
-        def __str__(self):
-            return self.value
 
-        @property
-        def f_i(self):
-            return np.exp(self.mu * self.T) / (self.w * np.exp(self.mu * self.T)).sum(axis=2, keepdims=True)
+        d1 = ( m + 0.5 * n **2 ) / (n * np.sqrt(T))
+        d2 = d1 - n * np.sqrt(T)
 
-        @property
-        def d_i(self):
-            return (np.log(self.f_i / self.M) + ((self.s ** 2) * self.T / 2)) / (self.s * np.sqrt(self.T))
+        return (l * (norm.cdf(d1) - np.exp(-m) * norm.cdf(d2))).sum(axis =1)
 
-        @property
-        def mu_t(self):
-            return (self.w * self.mu * np.exp(self.mu * self.T)).sum(axis=2, keepdims=True) / (
-                self.w * np.exp(self.mu * self.T)).sum(axis=2, keepdims=True)
 
-        @property
-        def value(self):
-            upper = (self.w * self.f_i * (norm.pdf(self.d_i) * self.s + 2 * np.sqrt(np.pi * self.T)
-                                          * norm.cdf(self.d_i) * (self.mu - self.mu_t))).sum(axis=2)
+    def _lognormal_mixture_price(self, X, F, K, r, T, w):
+        l = X[:self.mixture_depth].reshape((1, self.mixture_depth))
+        n = X[self.mixture_depth:].reshape((1, self.mixture_depth))
 
-            lower = (self.w * self.f_i * norm.pdf(self.d_i) / self.s).sum(axis=2)
+        F = F.reshape((F.shape[0], 1))
+        K = K.reshape((K.shape[0], 1))
+        T = T.reshape((T.shape[0], 1))
+        w = w.reshape((w.shape[0], 1))
+        r = r.reshape((r.shape[0], 1))
 
-            return upper / lower
+        P = np.exp(-r * T)
 
-        def plot(self):
-            fig = plt.figure()
-            ax = fig.gca(projection='3d')
+        d1 = (np.log(F / K) + 0.5 * n ** 2 * T) / (n * np.sqrt(T))
+        d2 = d1 - n * np.sqrt(T)
 
-            ax.plot_surface(self.M.squeeze(2), self.T.squeeze(2), self.value)
+        inner_sum = l * (F * norm.cdf(d1 * w) - K * norm.cdf(d2 * w))
 
-            plt.show()
+        return (w * P * inner_sum.sum(axis=1))[:, 0]
 
-    def local_volatility(self, X=None):
-        if X is None:
-            X = self._init_parameters()
+    def _lognormal_mixture_loss(self, X, F, K, r, T, w, y_true):
+        y_pred = self._lognormal_mixture_price(X, F, K, r, T, w)
+        return self._loss_mse(y_pred,y_true)
 
-        w, mu, s = self._split_parameter(X)
-        return self.LocalVolatility(w, mu, s, self.moneyness, self.expiration, self.future_price, self.N)
 
-    def _init_parameters(self):
-        w = np.array([1 / self.N] * (self.N - 1))
-        mu = np.array([0] * self.N)
-        s = np.array([self.init_vol] * self.N)
-
-        X = np.concatenate((w, mu, s), axis=0)
+    def _generate_X0(self):
+        N = self.mixture_depth
+        X = np.random.uniform(0, 1, N * 2)
+        X[:N] = X[:N] / X[:N].sum()
 
         return X
 
-    def _split_parameter(self, X):
-        w = X[0:(self.N - 1)]
-        mu = X[(self.N - 1):2 * self.N - 1]
-        s = X[2 * self.N - 1:]
-
-        w = np.concatenate((w, [1 - w.sum()]))
-
-        return w, mu, s
+    def _loss_mse(self, y_pred, y_true):
+        return np.inner(y_pred - y_true, y_pred - y_true) / y_pred.shape[0]
 
     @property
-    def moneyness(self):
-        return self.strike / self.future_price
+    def _bounds(self):
+        return [(0, 1)] * self.mixture_depth + [(0.000001, None)] * self.mixture_depth
+
+    @property
+    def _constrains(self):
+        N = self.mixture_depth
+        fun = lambda X: np.inner(X, np.array([1] * N + [0] * N)) - 1
+
+        return {'type': 'eq', 'fun': fun}
 
 
-def load_data():
-    df = pd.read_excel(r'VIX OPTION DATA.xlsm', 'Data')
-    df = df[df['OTM'] == 1]
-
-    option_price = df['Option']
-    future_price = df['FT']
-    strike = df['Strike']
-    expiration = df['T']
-    option_type = df['Type']
-
-    return option_price, future_price, strike, expiration, option_type
 
 
-option_price, future_price, strike, expiration, option_type = load_data()
+df = pd.read_excel('VIX OPTION DATA.xlsm', 1)
 
-v = VolatilityCalibration(option_price, future_price, strike, expiration, option_type)
+df['r'] = 0.0137
 
-X = np.array([0.7, 0.25, 0, 0.3, -0.5, 0.3, 0.6, 1])
+df['m'] = np.log(df['FT'] / df['Strike'])
 
-vol = v.local_volatility(X).mu_t
 
-print(vol)
+n = df[['Option','FT', 'Strike', 'r', 'T', 'Type','m']].as_matrix()
+
+vol = VolatilitySurface()
+
+O = n[:, 0]
+F = n[:, 1]
+K = n[:, 2]
+r = n[:, 3]
+T =  n[:, 4]
+w = n[:,5]
+m = n[:,6]
+
+print(vol.calibrate(O,F,K,r,T,w))
+# vol.load_X('vol.pkl')
+
+print(vol.X[-3:]/ np.sqrt(0.05))
+# print(vol.bs_volatility(np.array([0,0.3]),0.05))
+
